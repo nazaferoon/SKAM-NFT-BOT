@@ -1,6 +1,6 @@
 """Animated word-by-word Russian subtitles (ASS) synced to the voiceover clips.
 
-usage: python3 subs.py voice/script.txt out.ass [voice_track.wav]
+usage: python3 subs.py voice/script.txt out.ass [voice/asr_words.json]
 script.txt: one line per clip, in order ("01| текст ..."), text exactly as spoken.
 Word timings: each clip's speech regions (energy) are split proportionally to syllable
 weight, then every boundary is snapped to the nearest energy dip in the voice.
@@ -22,22 +22,31 @@ GOLD, RED, WHITE = '&H00D7FF&', '&H3333FF&', '&HFFFFFF&'   # ASS = BGR
 
 # ---------- text classification ----------
 GOLD_ROOTS = ('БИТКОИН', 'BITCOIN', 'BTC', 'ДОЛЛАР', 'МОНЕТ', 'МИЛЛИОН', 'МИЛЛИАРД', 'ТЫСЯЧ', 'ЛЕТ', 'ГОД', '$')
-RED_ROOTS = ('ОБВАЛ', 'ПАДЕН', 'УПАЛ', 'УПАД', 'РУХН', 'КРАХ', 'ОБЕСЦЕН', 'ПОТЕР', 'МИНУС', 'УБЫТ', 'ПАНИК', 'ОБНУЛ', 'СГОРЕ', 'ПРОВАЛ', 'НОЛЬ', 'ОБРУШ')
+ALWAYS_GOLD = ('БИТКОИН', 'BITCOIN', 'МИЛЛИОНЕР', 'ДОЛЛАР')
+RED_ROOTS = ('РУШ', 'ПАДА', 'ТЕРЯ', 'ОБВАЛ', 'ПАДЕН', 'УПАЛ', 'УПАД', 'РУХН', 'КРАХ', 'ОБЕСЦЕН', 'ПОТЕР', 'МИНУС', 'УБЫТ', 'ПАНИК', 'ОБНУЛ', 'СГОРЕ', 'ПРОВАЛ', 'НОЛЬ', 'ОБРУШ')
 VOWELS = set('аеёиоуыэюяaeiouy')
 
 def has_digit(w): return any(c.isdigit() for c in w)
 
 def classify(words):
-    """returns list of (style, bounce) per word; amounts glue number + unit as gold"""
-    out = []
+    """(style, bounce) per word. Gold: money, Bitcoin, numbers + their units.
+    Red: loss words; amounts inside a sentence about a loss are red too."""
+    out = []; sent_red = False; sent = []
+    def flush():
+        if sent_red:
+            for k in sent:
+                if out[k][0] == 'gold' and not words[k].upper().startswith(('BITCOIN', 'БИТКОИН')): out[k] = ('red', out[k][1])
     for i, w in enumerate(words):
         u = w.upper().strip('.,!?…:;—-«»"()')
-        prev = words[i - 1].upper() if i else ''
-        if any(r in u for r in RED_ROOTS): out.append(('red', False)); continue
-        if has_digit(u): out.append(('gold', True)); continue
-        if u.startswith(('БИТКОИН', 'BITCOIN')): out.append(('gold', False)); continue
-        if has_digit(prev) and any(u.startswith(r) for r in GOLD_ROOTS): out.append(('gold', False)); continue
-        out.append(('white', False))
+        prev = words[i - 1].upper().strip('.,!?…') if i else ''
+        if any(r in u for r in RED_ROOTS): out.append(('red', False)); sent_red = True
+        elif has_digit(u): out.append(('gold', True))
+        elif u.startswith(ALWAYS_GOLD): out.append(('gold', False))
+        elif has_digit(prev) and any(u.startswith(r) for r in GOLD_ROOTS): out.append(('gold', False))
+        else: out.append(('white', False))
+        sent.append(i)
+        if re.search(r'[.!?…]$', w): flush(); sent = []; sent_red = False
+    flush()
     return out
 
 def syllables(w):
@@ -45,9 +54,14 @@ def syllables(w):
     return max(1, sum(c.lower() in VOWELS for c in w))
 
 def tokenize(text):
-    # keep "100 000" and "12,5" as single tokens
+    """tokens; a trailing {n} says the token covers n spoken (ASR) words, e.g. 12,5{3}"""
     text = re.sub(r'(\d)\s+(?=\d{3}\b)', '\\1\u00a0', text.strip())
-    return [t for t in text.split() if t]
+    toks = [t for t in re.split(r'[ \t\n]+', text) if t]
+    out, spans = [], []
+    for t in toks:
+        m = re.match(r'^(.*)\{(\d+)\}$', t)
+        out.append(m.group(1) if m else t); spans.append(int(m.group(2)) if m else 1)
+    return out, spans
 
 # ---------- audio analysis ----------
 def load(path):
@@ -113,7 +127,8 @@ def phrases_for_clip(words, times, regs, max_w=6, min_w=3):
             if unit_follow and len(cur) > 2: out.append(cur[:-1]); cur = [cur[-1]]; continue
             out.append(cur); cur = []
     if cur:
-        if out and len(cur) < 2 and len(out[-1]) + len(cur) <= max_w + 1: out[-1] += cur
+        if out and len(cur) < 2 and len(out[-1]) >= 4: cur = [out[-1].pop()] + cur; out.append(cur)   # no orphans
+        elif out and len(cur) < 2: out[-1] += cur
         else: out.append(cur)
     return out
 
@@ -124,7 +139,7 @@ def text_w(s, fs=FS):
     k = fs / asc_desc / upem
     return sum(hmtx[cmap.get(ord(c), cmap[ord('?')])][0] for c in s) * k
 
-def layout(words, cls):
+def layout(words, cls, yc=Y_CENTER):
     ws = [w.upper() for w in words]; space = text_w(' ') * 1.15
     widths = [text_w(w) * (1.07 if c[0] != 'white' else 1.0) + 10 for w, c in zip(ws, cls)]
     full = sum(widths) + space * (len(ws) - 1)
@@ -140,7 +155,7 @@ def layout(words, cls):
     lw = [sum(widths[i] for i in L) + space * (len(L) - 1) for L in lines]
     if max(lw) > MAX_LINE_W: scale = MAX_LINE_W / max(lw)
     pos = {}; lh = FS * LINE_GAP * scale
-    y0 = Y_CENTER - (len(lines) - 1) * lh / 2
+    y0 = yc - (len(lines) - 1) * lh / 2
     for li, L in enumerate(lines):
         x = W / 2 - lw[li] * scale / 2
         for i in L:
@@ -182,6 +197,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 def main():
     script, out = sys.argv[1], sys.argv[2]
+    asr = json.load(open(sys.argv[3], encoding='utf-8')) if len(sys.argv) > 3 else None
     clips = sorted(glob.glob(os.path.join(HERE, 'voice', '[0-9][0-9].mp3')))
     lines = {}
     for ln in open(script, encoding='utf-8'):
@@ -189,16 +205,26 @@ def main():
     events, report, off = [], [], 0.0
     for ci, path in enumerate(clips, 1):
         x = load(path); dur = len(x) / SR
-        words = tokenize(lines.get(ci, ''))
+        words, spans = tokenize(lines.get(ci, ''))
         if words:
-            times, regs = align_clip(words, x)
+            key = os.path.basename(path)[:2]
+            if asr and key in asr:   # exact per-word timing from speech recognition
+                aw = asr[key]; assert sum(spans) == len(aw), (key, sum(spans), len(aw), [w[0] for w in aw])
+                times, j = [], 0
+                for n in spans: times.append((max(0.0, aw[j][1] - 0.02), aw[j + n - 1][2])); j += n
+                keep = [k for k, w in enumerate(words) if not w.startswith('_')]   # _x{n}: spoken sound, not subtitled
+                words = [words[k] for k in keep]; times = [times[k] for k in keep]
+                regs = None
+            else:
+                times, regs = align_clip(words, x)
             cls = classify(words)
             groups = phrases_for_clip(words, times, regs)
             for gi, g in enumerate(groups):
                 p_start = off + times[g[0]][0]
                 nxt = off + times[groups[gi + 1][0]][0] if gi + 1 < len(groups) else None
                 p_end = nxt if nxt is not None else off + min(dur, times[g[-1]][1] + 0.45)
-                ws, pos, scale = layout([words[i] for i in g], [cls[i] for i in g])
+                yc = 1330 if (23.0 <= p_start < 30.0 or 35.0 <= p_start < 41.0) else Y_CENTER   # keep clear of the giant coin
+                ws, pos, scale = layout([words[i] for i in g], [cls[i] for i in g], yc)
                 for j, i in enumerate(g):
                     events.append(word_event(ws[j], *cls[i], off + times[i][0], p_end, *pos[j], scale))
                 report.append(f'{p_start:6.2f}-{p_end:6.2f}  ' + ' '.join(f'{words[i]}@{off + times[i][0]:.2f}' for i in g))
